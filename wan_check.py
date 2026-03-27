@@ -18,7 +18,7 @@ import requests
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
-NBN_IP = os.getenv("NBN_STATIC_IP", "180.150.43.236")
+NBN_IP = os.getenv("NBN_STATIC_IP", "192.168.0.1.1")
 HEARTBEAT_PRIMARY = os.getenv("HEARTBEAT_PRIMARY", "https://uptime.betterstack.com/api/v1/heartbeat/<YOUR_PRIMARY_ID>")
 HEARTBEAT_LTE = os.getenv("HEARTBEAT_LTE", "https://uptime.betterstack.com/api/v1/heartbeat/<YOUR_LTE_ID>")
 INTERVAL = int(os.getenv("MONITOR_INTERVAL", "60"))
