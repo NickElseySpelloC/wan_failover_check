@@ -1,10 +1,21 @@
-# Python-generated files
+# Python
 __pycache__/
+.DS_Store
+.python-version
+.ruff_cache/
+.venv/
+.vscode/
+*.egg
+*.egg-info
 *.py[oc]
+*.tar.bz2
+*.tar.gz
+*.whl
+*.zip
 build/
 dist/
+venv/
 wheels/
-*.egg-info
+.env
+.cache_ggshield
 
-# Virtual environments
-.venv
