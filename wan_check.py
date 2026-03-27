@@ -11,8 +11,11 @@ Environment variables:
   MONITOR_INTERVAL     Polling interval in seconds (default: 60)
 """
 
+import json
 import os
+import pathlib
 import time
+from datetime import UTC, datetime
 
 import requests
 
@@ -23,6 +26,7 @@ HEARTBEAT_PRIMARY = os.getenv("HEARTBEAT_PRIMARY", "https://uptime.betterstack.c
 HEARTBEAT_LTE = os.getenv("HEARTBEAT_LTE", "https://uptime.betterstack.com/api/v1/heartbeat/<YOUR_LTE_ID>")
 INTERVAL = int(os.getenv("MONITOR_INTERVAL", "60"))
 HTTP_TIMEOUT = 8
+STATUS_FILE = "status.json"
 
 UA = {"User-Agent": "failover-monitor/1.0"}
 
@@ -92,6 +96,23 @@ def ping_heartbeat(url: str) -> bool:
     else:
         return True
 
+
+def write_status(is_primary: bool, state: str, ip: str) -> None:  # noqa: FBT001
+    """Write the current WAN status to STATUS_FILE."""
+    payload = {
+        "timestamp": datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "on_primary": is_primary,
+        "status": state,
+        "external_ip": ip,
+    }
+    try:
+        with pathlib.Path(STATUS_FILE).open("w", encoding="utf-8") as f:
+            json.dump(payload, f, indent=2)
+            f.write("\n")
+    except OSError as e:
+        print(f"  [status] Failed to write {STATUS_FILE}: {e}")
+
+
 # ── Main loop ─────────────────────────────────────────────────────────────────
 
 
@@ -100,33 +121,39 @@ def main():
     last_state = None  # track state changes for cleaner logging
 
     print(f"Monitoring started. NBN IP: {NBN_IP}  Interval: {INTERVAL}s")
+    print("Press Ctrl-C to stop.")
 
-    while True:
-        try:
-            ip = get_external_ip()
-            primary = on_nbn(ip)
-            state = "NBN (primary)" if primary else "5G FAILOVER (Optus)"
-            url = HEARTBEAT_PRIMARY if primary else HEARTBEAT_LTE
+    try:
+        while True:
+            try:
+                ip = get_external_ip()
+                primary = on_nbn(ip)
+                state = "NBN (primary)" if primary else "5G FAILOVER (Optus)"
+                url = HEARTBEAT_PRIMARY if primary else HEARTBEAT_LTE
 
-            if state != last_state:
-                print(f"[transition] → {state}  (external IP: {ip})")
-                last_state = state
+                if state != last_state:
+                    print(f"[transition] → {state}  (external IP: {ip})")
+                    last_state = state
 
-            ok = ping_heartbeat(url)
+                write_status(primary, state, ip)
+                ok = ping_heartbeat(url)
 
-            if ok:
-                consecutive_errors = 0
-                print(f"[ok] {state}  ext-ip={ip}")
-            else:
+                if ok:
+                    consecutive_errors = 0
+                    print(f"[ok] {state}  ext-ip={ip}")
+                else:
+                    consecutive_errors += 1
+
+            except RuntimeError as e:
                 consecutive_errors += 1
+                print(f"[error] {e}")
 
-        except RuntimeError as e:
-            consecutive_errors += 1
-            print(f"[error] {e}")
+            # Gentle back-off: x1 / x2 / x3 interval on repeated errors, then holds
+            sleep_for = INTERVAL * min(3, max(1, consecutive_errors))
+            time.sleep(sleep_for)
 
-        # Gentle back-off: x1 / x2 / x3 interval on repeated errors, then holds
-        sleep_for = INTERVAL * min(3, max(1, consecutive_errors))
-        time.sleep(sleep_for)
+    except KeyboardInterrupt:
+        print("\nShutting down.")
 
 
 if __name__ == "__main__":
