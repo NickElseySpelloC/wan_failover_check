@@ -1,0 +1,11 @@
+[project]
+name = "wan-failover-check"
+version = "0.1.0"
+description = "WAN Failover Check"
+readme = "README.md"
+requires-python = ">=3.13"
+service_name="WANFailoverCheck"
+launch_path="wan_check.py"
+dependencies = [
+    "requests>=2.33.0",
+]
