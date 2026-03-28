@@ -14,10 +14,14 @@ Environment variables:
 import json
 import os
 import pathlib
+import threading
 import time
 from datetime import UTC, datetime
 
 import requests
+import uvicorn
+from fastapi import FastAPI
+from fastapi.responses import JSONResponse
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
@@ -27,9 +31,6 @@ HEARTBEAT_LTE = os.getenv("HEARTBEAT_LTE", "https://uptime.betterstack.com/api/v
 INTERVAL = int(os.getenv("MONITOR_INTERVAL", "60"))
 HTTP_TIMEOUT = 8
 STATUS_FILE = "status.json"
-
-UA = {"User-Agent": "failover-monitor/1.0"}
-
 # Multiple IP-echo services, tried in order — protects against any one being down.
 IP_ECHO_URLS = [
     "https://api.ipify.org",
@@ -37,6 +38,24 @@ IP_ECHO_URLS = [
     "https://ifconfig.me/ip",
     "https://checkip.amazonaws.com",
 ]
+API_IP = os.getenv("API_IP", "0.0.0.0")  # noqa: S104
+API_PORT = int(os.getenv("API_PORT", "8080"))
+UA = {"User-Agent": "failover-monitor/1.0"}
+
+# ── FastAPI app ───────────────────────────────────────────────────────────────
+
+app = FastAPI(title="WAN Failover Monitor")
+
+
+@app.get("/status")
+def get_status():
+    """Return the current WAN status from the status file."""
+    try:
+        with pathlib.Path(STATUS_FILE).open(encoding="utf-8") as f:
+            return JSONResponse(content=json.load(f))
+    except (OSError, json.JSONDecodeError) as e:
+        return JSONResponse(status_code=503, content={"error": str(e)})
+
 
 # ── Core logic ────────────────────────────────────────────────────────────────
 
@@ -97,7 +116,7 @@ def ping_heartbeat(url: str) -> bool:
         return True
 
 
-def write_status(is_primary: bool, state: str, ip: str) -> None:  # noqa: FBT001
+def write_status(is_primary: bool, state: str, ip: str) -> None:
     """Write the current WAN status to STATUS_FILE."""
     payload = {
         "timestamp": datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
@@ -116,7 +135,16 @@ def write_status(is_primary: bool, state: str, ip: str) -> None:  # noqa: FBT001
 # ── Main loop ─────────────────────────────────────────────────────────────────
 
 
+def _start_api():
+    """Run the FastAPI server in a background daemon thread."""
+    uvicorn.run(app, host=API_IP, port=API_PORT, log_level="warning")
+
+
 def main():
+    api_thread = threading.Thread(target=_start_api, daemon=True, name="api")
+    api_thread.start()
+    print(f"API listening on http://{API_IP}:{API_PORT}/status")
+
     consecutive_errors = 0
     last_state = None  # track state changes for cleaner logging
 
@@ -128,7 +156,7 @@ def main():
             try:
                 ip = get_external_ip()
                 primary = on_nbn(ip)
-                state = "NBN (primary)" if primary else "5G FAILOVER (Optus)"
+                state = "NBN (primary)" if primary else "5G Backup"
                 url = HEARTBEAT_PRIMARY if primary else HEARTBEAT_LTE
 
                 if state != last_state:

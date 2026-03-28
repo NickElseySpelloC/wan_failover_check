@@ -19,3 +19,4 @@ wheels/
 .env
 .cache_ggshield
 
+status.json
