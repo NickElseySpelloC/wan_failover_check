@@ -3,14 +3,16 @@
 Application Launcher
 
 Requires Python and UV to be installed
+
+3/4/2026: Change default directory to the script location, and allow --homedir to override it.
 =========================================================='
 
 # set -euo pipefail
 
 PYPROJECT="pyproject.toml"
 
-# Parse --homedir argument from any position, default to current working directory
-HomeDir="$(pwd)"
+# Parse --homedir argument from any position, default to this script's directory
+HomeDir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 for ((i=1; i<=$#; i++)); do
   if [ "${!i}" = "--homedir" ]; then
     j=$((i+1))
@@ -85,7 +87,7 @@ term_handler() {
 }
 trap term_handler SIGINT SIGTERM
 
-echo "[launcher] Starting app with uv run $ScriptName ..."
+echo "[launcher] Starting app with uv run $ScriptName from directory $HomeDir ..."
 "$UVCmd" run "$ScriptName" "$@"
 app_rc=$?
 

@@ -11,9 +11,11 @@ Environment variables:
   MONITOR_INTERVAL     Polling interval in seconds (default: 60)
 """
 
+import argparse
 import json
 import os
 import pathlib
+import sys
 import threading
 import time
 from datetime import UTC, datetime
@@ -132,6 +134,56 @@ def write_status(is_primary: bool, state: str, ip: str) -> None:
         print(f"  [status] Failed to write {STATUS_FILE}: {e}")
 
 
+def check_wan(*, write_file: bool, send_heartbeat: bool) -> tuple[bool, str, str, bool | None]:
+    """Run a single WAN check and optionally persist status and send a heartbeat.
+
+    Args:
+        write_file (bool): Whether to write the status file.
+        send_heartbeat (bool): Whether to send a heartbeat to Better Stack.
+
+    Returns:
+        tuple: (is_primary, state, external_ip, heartbeat_ok)
+        is_primary (bool): True if on primary WAN, False if on failover.
+        state (str): Human-readable state string, e.g. "NBN (primary)" or "5G Backup".
+        external_ip (str): The current external IP address.
+        heartbeat_ok (bool | None): True if heartbeat succeeded, False if it failed, or None if not sent.
+    """
+    ip = get_external_ip()
+    primary = on_nbn(ip)
+    state = "NBN (primary)" if primary else "5G Backup"
+
+    if write_file:
+        write_status(primary, state, ip)
+
+    heartbeat_ok = None
+    if send_heartbeat:
+        url = HEARTBEAT_PRIMARY if primary else HEARTBEAT_LTE
+        heartbeat_ok = ping_heartbeat(url)
+
+    return primary, state, ip, heartbeat_ok
+
+
+def build_parser() -> argparse.ArgumentParser:
+    """Create the command line parser for the monitor.
+
+    Returns:
+        argparse.ArgumentParser: The configured argument parser.
+    """
+    parser = argparse.ArgumentParser(description="Monitor WAN failover state.")
+    mode_group = parser.add_mutually_exclusive_group()
+    mode_group.add_argument(
+        "--onetime",
+        action="store_true",
+        help="Do one WAN check, write status.json, and exit.",
+    )
+    mode_group.add_argument(
+        "--onprimary",
+        action="store_true",
+        help='Print "Yes" when on the primary connection, otherwise print "false", and exit.',
+    )
+    return parser
+
+
 # ── Main loop ─────────────────────────────────────────────────────────────────
 
 
@@ -140,7 +192,47 @@ def _start_api():
     uvicorn.run(app, host=API_IP, port=API_PORT, log_level="warning")
 
 
-def main():
+def run_onetime() -> int:
+    """Run one check, write the status file, and exit.
+
+    Returns:
+        int: Process exit code.
+    """
+    try:
+        _, state, ip, _ = check_wan(write_file=True, send_heartbeat=False)
+    except RuntimeError as e:
+        print(f"[error] {e}", file=sys.stderr)
+        return 1
+
+    print(f"[ok] {state}  ext-ip={ip}")
+    return 0
+
+
+def run_onprimary() -> int:
+    """Print whether the connection is currently on the primary WAN.
+
+    Returns:
+        int: Process exit code.
+    """
+    try:
+        primary, _, _, _ = check_wan(write_file=False, send_heartbeat=False)
+    except RuntimeError as e:
+        print(f"[error] {e}", file=sys.stderr)
+        return 1
+
+    print("Yes" if primary else "No")
+    return 0
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = build_parser().parse_args(argv)
+
+    if args.onetime:
+        return run_onetime()
+
+    if args.onprimary:
+        return run_onprimary()
+
     api_thread = threading.Thread(target=_start_api, daemon=True, name="api")
     api_thread.start()
     print(f"API listening on http://{API_IP}:{API_PORT}/status")
@@ -154,19 +246,13 @@ def main():
     try:
         while True:
             try:
-                ip = get_external_ip()
-                primary = on_nbn(ip)
-                state = "NBN (primary)" if primary else "5G Backup"
-                url = HEARTBEAT_PRIMARY if primary else HEARTBEAT_LTE
+                _, state, ip, heartbeat_ok = check_wan(write_file=True, send_heartbeat=True)
 
                 if state != last_state:
                     print(f"[transition] → {state}  (external IP: {ip})")
                     last_state = state
 
-                write_status(primary, state, ip)
-                ok = ping_heartbeat(url)
-
-                if ok:
+                if heartbeat_ok:
                     consecutive_errors = 0
                     print(f"[ok] {state}  ext-ip={ip}")
                 else:
@@ -183,6 +269,8 @@ def main():
     except KeyboardInterrupt:
         print("\nShutting down.")
 
+    return 0
+
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())
