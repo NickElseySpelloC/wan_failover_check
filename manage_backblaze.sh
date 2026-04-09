@@ -27,6 +27,16 @@ fi
 
 cd "$ScriptDir"
 
+# Load environment variables from .env if present (in HomeDir)
+# Note: this "sources" the file, so it should contain simple KEY=VALUE lines.
+EnvFile=".env"
+if [ -f "$EnvFile" ]; then
+  set -a
+  . "$EnvFile"
+  set +a
+fi
+
+
 if ! command -v uv >/dev/null 2>&1; then
 	echo "[manage_backblaze] Error: uv is not available in PATH" >&2
 	exit 1
