@@ -6,9 +6,15 @@ TOGGLE_BACKBLAZE_SCRIPT="$HOME/scripts/toggle_backblaze_settings/toggle_backblaz
 
 ScriptDir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 WanCheckScript="$ScriptDir/wan_check.py"
+VenvActivate="$ScriptDir/.venv/bin/activate"
 
 if [ ! -f "$WanCheckScript" ]; then
 	echo "[manage_backblaze] Error: wan_check.py not found at $WanCheckScript" >&2
+	exit 1
+fi
+
+if [ ! -f "$VenvActivate" ]; then
+	echo "[manage_backblaze] Error: virtual environment activate script not found at $VenvActivate" >&2
 	exit 1
 fi
 
@@ -16,6 +22,17 @@ if [ ! -x "$TOGGLE_BACKBLAZE_SCRIPT" ]; then
 	echo "[manage_backblaze] Error: toggle_backblaze_settings.sh is not executable at $TOGGLE_BACKBLAZE_SCRIPT" >&2
 	exit 1
 fi
+
+. "$VenvActivate"
+
+cd "$ScriptDir"
+
+if ! command -v uv >/dev/null 2>&1; then
+	echo "[manage_backblaze] Error: uv is not available in PATH" >&2
+	exit 1
+fi
+
+uv sync
 
 check_output="$(python3 "$WanCheckScript" --onprimary)"
 

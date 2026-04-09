@@ -6,9 +6,10 @@ By comparing the current external IP against the known static NBN IP.
 
 Environment variables:
   NBN_STATIC_IP        Your static NBN IP (default: 180.150.43.236)
-  HEARTBEAT_PRIMARY    Better Stack heartbeat URL for NBN-up state
-  HEARTBEAT_LTE        Better Stack heartbeat URL for 5G-failover state
+    HEARTBEAT_PRIMARY    Better Stack heartbeat URL for NBN-up state
+    HEARTBEAT_LTE        Better Stack heartbeat URL for 5G-failover state
   MONITOR_INTERVAL     Polling interval in seconds (default: 60)
+    API_IP               Bind address for the optional status API
 """
 
 import argparse
@@ -28,8 +29,8 @@ from fastapi.responses import JSONResponse
 # ── Config ────────────────────────────────────────────────────────────────────
 
 NBN_IP = os.getenv("NBN_STATIC_IP", "192.168.0.1.1")
-HEARTBEAT_PRIMARY = os.getenv("HEARTBEAT_PRIMARY", "https://uptime.betterstack.com/api/v1/heartbeat/<YOUR_PRIMARY_ID>")
-HEARTBEAT_LTE = os.getenv("HEARTBEAT_LTE", "https://uptime.betterstack.com/api/v1/heartbeat/<YOUR_LTE_ID>")
+HEARTBEAT_PRIMARY = os.getenv("HEARTBEAT_PRIMARY")
+HEARTBEAT_LTE = os.getenv("HEARTBEAT_LTE")
 INTERVAL = int(os.getenv("MONITOR_INTERVAL", "60"))
 HTTP_TIMEOUT = 8
 STATUS_FILE = "status.json"
@@ -40,7 +41,7 @@ IP_ECHO_URLS = [
     "https://ifconfig.me/ip",
     "https://checkip.amazonaws.com",
 ]
-API_IP = os.getenv("API_IP", "0.0.0.0")  # noqa: S104
+API_IP = os.getenv("API_IP")
 API_PORT = int(os.getenv("API_PORT", "8080"))
 UA = {"User-Agent": "failover-monitor/1.0"}
 
@@ -118,6 +119,18 @@ def ping_heartbeat(url: str) -> bool:
         return True
 
 
+def heartbeat_enabled(*, noheartbeat: bool) -> bool:
+    """Return whether heartbeats should be sent for the current run.
+
+    Args:
+        noheartbeat (bool): Whether heartbeats were disabled by CLI flag.
+
+    Returns:
+        bool: True when heartbeats are enabled, False otherwise.
+    """
+    return not noheartbeat and bool(HEARTBEAT_PRIMARY)
+
+
 def write_status(is_primary: bool, state: str, ip: str) -> None:
     """Write the current WAN status to STATUS_FILE."""
     payload = {
@@ -158,7 +171,8 @@ def check_wan(*, write_file: bool, send_heartbeat: bool) -> tuple[bool, str, str
     heartbeat_ok = None
     if send_heartbeat:
         url = HEARTBEAT_PRIMARY if primary else HEARTBEAT_LTE
-        heartbeat_ok = ping_heartbeat(url)
+        if url:
+            heartbeat_ok = ping_heartbeat(url)
 
     return primary, state, ip, heartbeat_ok
 
@@ -181,15 +195,20 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help='Print "Yes" when on the primary connection, otherwise print "false", and exit.',
     )
+    parser.add_argument(
+        "--noheartbeat",
+        action="store_true",
+        help="Disable Better Stack heartbeats for this run.",
+    )
     return parser
 
 
 # ── Main loop ─────────────────────────────────────────────────────────────────
 
 
-def _start_api():
+def _start_api(host: str):
     """Run the FastAPI server in a background daemon thread."""
-    uvicorn.run(app, host=API_IP, port=API_PORT, log_level="warning")
+    uvicorn.run(app, host=host, port=API_PORT, log_level="warning")
 
 
 def run_onetime() -> int:
@@ -226,6 +245,7 @@ def run_onprimary() -> int:
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+    send_heartbeat = heartbeat_enabled(noheartbeat=args.noheartbeat)
 
     if args.onetime:
         return run_onetime()
@@ -233,9 +253,15 @@ def main(argv: list[str] | None = None) -> int:
     if args.onprimary:
         return run_onprimary()
 
-    api_thread = threading.Thread(target=_start_api, daemon=True, name="api")
-    api_thread.start()
-    print(f"API listening on http://{API_IP}:{API_PORT}/status")
+    if API_IP:
+        api_thread = threading.Thread(target=_start_api, args=(API_IP,), daemon=True, name="api")
+        api_thread.start()
+        print(f"API listening on http://{API_IP}:{API_PORT}/status")
+    else:
+        print("Status API disabled; set API_IP to enable it.")
+
+    if not send_heartbeat:
+        print("Heartbeats disabled.")
 
     consecutive_errors = 0
     last_state = None  # track state changes for cleaner logging
@@ -246,17 +272,17 @@ def main(argv: list[str] | None = None) -> int:
     try:
         while True:
             try:
-                _, state, ip, heartbeat_ok = check_wan(write_file=True, send_heartbeat=True)
+                _, state, ip, heartbeat_ok = check_wan(write_file=True, send_heartbeat=send_heartbeat)
 
                 if state != last_state:
                     print(f"[transition] → {state}  (external IP: {ip})")
                     last_state = state
 
-                if heartbeat_ok:
+                if heartbeat_ok is False:
+                    consecutive_errors += 1
+                else:
                     consecutive_errors = 0
                     print(f"[ok] {state}  ext-ip={ip}")
-                else:
-                    consecutive_errors += 1
 
             except RuntimeError as e:
                 consecutive_errors += 1
