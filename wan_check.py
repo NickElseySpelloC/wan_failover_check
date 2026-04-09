@@ -28,7 +28,7 @@ from fastapi.responses import JSONResponse
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
-NBN_IP = os.getenv("NBN_STATIC_IP", "192.168.0.1.1")
+NBN_IP = os.getenv("NBN_STATIC_IP")
 HEARTBEAT_PRIMARY = os.getenv("HEARTBEAT_PRIMARY")
 HEARTBEAT_LTE = os.getenv("HEARTBEAT_LTE")
 INTERVAL = int(os.getenv("MONITOR_INTERVAL", "60"))
@@ -246,6 +246,10 @@ def run_onprimary() -> int:
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     send_heartbeat = heartbeat_enabled(noheartbeat=args.noheartbeat)
+
+    if not NBN_IP:
+        print("Error: NBN_STATIC_IP environment variable is not set.", file=sys.stderr)
+        return 1
 
     if args.onetime:
         return run_onetime()
