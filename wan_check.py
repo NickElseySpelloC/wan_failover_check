@@ -10,9 +10,11 @@ Environment variables:
     HEARTBEAT_LTE        Better Stack heartbeat URL for 5G-failover state
   MONITOR_INTERVAL     Polling interval in seconds (default: 60)
     API_IP               Bind address for the optional status API
+    FAILOVER_CSV_FILE    CSV file used to record backup WAN intervals
 """
 
 import argparse
+import csv
 import json
 import os
 import pathlib
@@ -34,6 +36,9 @@ HEARTBEAT_LTE = os.getenv("HEARTBEAT_LTE")
 INTERVAL = int(os.getenv("MONITOR_INTERVAL", "60"))
 HTTP_TIMEOUT = 8
 STATUS_FILE = "status.json"
+FAILOVER_CSV_FILE = os.getenv("FAILOVER_CSV_FILE", "failover_history.csv")
+FAILOVER_CSV_HEADERS = ["Start Time", "End Time", "Duration Hours"]
+LOCAL_DATETIME_FORMAT = "%Y-%m-%d %H:%M:%S"
 # Multiple IP-echo services, tried in order — protects against any one being down.
 IP_ECHO_URLS = [
     "https://api.ipify.org",
@@ -88,16 +93,17 @@ def get_external_ip() -> str:
     raise RuntimeError(error_msg)
 
 
-def on_nbn(external_ip: str) -> bool:
+def on_nbn(external_ip: str, nbn_ip: str) -> bool:
     """True when the current external IP matches our static NBN address.
 
     Args:
         external_ip (str): The current external IP address to check.
+        nbn_ip (str): The configured primary WAN IP address.
 
     Returns:
         bool: True if the external IP matches the NBN static IP, False otherwise.
     """
-    return external_ip == NBN_IP
+    return external_ip == nbn_ip
 
 
 def ping_heartbeat(url: str) -> bool:
@@ -147,10 +153,129 @@ def write_status(is_primary: bool, state: str, ip: str) -> None:
         print(f"  [status] Failed to write {STATUS_FILE}: {e}")
 
 
-def check_wan(*, write_file: bool, send_heartbeat: bool) -> tuple[bool, str, str, bool | None]:
+def format_local_timestamp(timestamp: datetime) -> str:
+    """Format a local timestamp for CSV output.
+
+    Args:
+        timestamp (datetime): The timestamp to format.
+
+    Returns:
+        str: The timestamp in local CSV format.
+    """
+    return timestamp.strftime(LOCAL_DATETIME_FORMAT)
+
+
+def ensure_failover_csv_exists() -> pathlib.Path:
+    """Create the failover CSV with headers when it does not yet exist.
+
+    Returns:
+        pathlib.Path: The path to the failover CSV file.
+    """
+    csv_path = pathlib.Path(FAILOVER_CSV_FILE)
+    if csv_path.exists():
+        return csv_path
+
+    try:
+        with csv_path.open("w", encoding="utf-8", newline="") as csv_file:
+            writer = csv.DictWriter(csv_file, fieldnames=FAILOVER_CSV_HEADERS)
+            writer.writeheader()
+    except OSError as e:
+        print(f"  [failover-csv] Failed to create {FAILOVER_CSV_FILE}: {e}")
+
+    return csv_path
+
+
+def load_failover_rows(csv_path: pathlib.Path) -> list[dict[str, str]]:
+    """Load all failover CSV rows, returning an empty list on read errors.
+
+    Args:
+        csv_path (pathlib.Path): The CSV file to read.
+
+    Returns:
+        list[dict[str, str]]: The normalized CSV rows.
+    """
+    try:
+        with csv_path.open(encoding="utf-8", newline="") as csv_file:
+            reader = csv.DictReader(csv_file)
+            return [
+                {header: (row.get(header) or "") for header in FAILOVER_CSV_HEADERS}
+                for row in reader
+            ]
+    except OSError as e:
+        print(f"  [failover-csv] Failed to read {FAILOVER_CSV_FILE}: {e}")
+    except csv.Error as e:
+        print(f"  [failover-csv] Failed to parse {FAILOVER_CSV_FILE}: {e}")
+
+    return []
+
+
+def save_failover_rows(csv_path: pathlib.Path, rows: list[dict[str, str]]) -> None:
+    """Persist the full failover CSV contents."""
+    try:
+        with csv_path.open("w", encoding="utf-8", newline="") as csv_file:
+            writer = csv.DictWriter(csv_file, fieldnames=FAILOVER_CSV_HEADERS)
+            writer.writeheader()
+            writer.writerows(rows)
+    except OSError as e:
+        print(f"  [failover-csv] Failed to write {FAILOVER_CSV_FILE}: {e}")
+
+
+def find_open_failover_row(rows: list[dict[str, str]]) -> int | None:
+    """Return the index of the first open failover row, if present."""
+    for index, row in enumerate(rows):
+        if not row["End Time"].strip():
+            return index
+    return None
+
+
+def update_failover_csv(*, is_primary: bool, observed_at: datetime | None = None) -> None:
+    """Open or close a failover CSV record based on the current WAN state."""
+    csv_path = ensure_failover_csv_exists()
+    if not csv_path.exists():
+        return
+
+    timestamp = observed_at or datetime.now().astimezone().replace(microsecond=0)
+    rows = load_failover_rows(csv_path)
+    open_row_index = find_open_failover_row(rows)
+
+    if not is_primary:
+        if open_row_index is not None:
+            return
+
+        rows.append(
+            {
+                "Start Time": format_local_timestamp(timestamp),
+                "End Time": "",
+                "Duration Hours": "",
+            }
+        )
+        save_failover_rows(csv_path, rows)
+        return
+
+    if open_row_index is None:
+        return
+
+    rows[open_row_index]["End Time"] = format_local_timestamp(timestamp)
+
+    try:
+        start_time = datetime.strptime(
+            rows[open_row_index]["Start Time"], LOCAL_DATETIME_FORMAT
+        ).replace(tzinfo=timestamp.tzinfo)
+    except ValueError as e:
+        print(f"  [failover-csv] Failed to parse failover start time: {e}")
+        rows[open_row_index]["Duration Hours"] = ""
+    else:
+        duration_hours = (timestamp - start_time).total_seconds() / 3600
+        rows[open_row_index]["Duration Hours"] = f"{duration_hours:.2f}"
+
+    save_failover_rows(csv_path, rows)
+
+
+def check_wan(*, nbn_ip: str, write_file: bool, send_heartbeat: bool) -> tuple[bool, str, str, bool | None]:
     """Run a single WAN check and optionally persist status and send a heartbeat.
 
     Args:
+        nbn_ip (str): The configured primary WAN IP address.
         write_file (bool): Whether to write the status file.
         send_heartbeat (bool): Whether to send a heartbeat to Better Stack.
 
@@ -162,11 +287,12 @@ def check_wan(*, write_file: bool, send_heartbeat: bool) -> tuple[bool, str, str
         heartbeat_ok (bool | None): True if heartbeat succeeded, False if it failed, or None if not sent.
     """
     ip = get_external_ip()
-    primary = on_nbn(ip)
+    primary = on_nbn(ip, nbn_ip)
     state = "NBN (primary)" if primary else "5G Backup"
 
     if write_file:
         write_status(primary, state, ip)
+        update_failover_csv(is_primary=primary)
 
     heartbeat_ok = None
     if send_heartbeat:
@@ -196,6 +322,10 @@ def build_parser() -> argparse.ArgumentParser:
         help='Print "Yes" when on the primary connection, otherwise print "false", and exit.',
     )
     parser.add_argument(
+        "--nbn-ip",
+        help="Override the primary WAN IP instead of using NBN_STATIC_IP from the environment.",
+    )
+    parser.add_argument(
         "--noheartbeat",
         action="store_true",
         help="Disable Better Stack heartbeats for this run.",
@@ -211,14 +341,17 @@ def _start_api(host: str):
     uvicorn.run(app, host=host, port=API_PORT, log_level="warning")
 
 
-def run_onetime() -> int:
+def run_onetime(*, nbn_ip: str) -> int:
     """Run one check, write the status file, and exit.
+
+    Args:
+        nbn_ip (str): The configured primary WAN IP address.
 
     Returns:
         int: Process exit code.
     """
     try:
-        _, state, ip, _ = check_wan(write_file=True, send_heartbeat=False)
+        _, state, ip, _ = check_wan(nbn_ip=nbn_ip, write_file=True, send_heartbeat=False)
     except RuntimeError as e:
         print(f"[error] {e}", file=sys.stderr)
         return 1
@@ -227,14 +360,17 @@ def run_onetime() -> int:
     return 0
 
 
-def run_onprimary() -> int:
+def run_onprimary(*, nbn_ip: str) -> int:
     """Print whether the connection is currently on the primary WAN.
+
+    Args:
+        nbn_ip (str): The configured primary WAN IP address.
 
     Returns:
         int: Process exit code.
     """
     try:
-        primary, _, _, _ = check_wan(write_file=False, send_heartbeat=False)
+        primary, _, _, _ = check_wan(nbn_ip=nbn_ip, write_file=True, send_heartbeat=False)
     except RuntimeError as e:
         print(f"[error] {e}", file=sys.stderr)
         return 1
@@ -246,16 +382,17 @@ def run_onprimary() -> int:
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     send_heartbeat = heartbeat_enabled(noheartbeat=args.noheartbeat)
+    nbn_ip = args.nbn_ip or NBN_IP
 
-    if not NBN_IP:
-        print("Error: NBN_STATIC_IP environment variable is not set.", file=sys.stderr)
+    if not nbn_ip:
+        print("Error: NBN_STATIC_IP environment variable is not set and --nbn-ip was not provided.", file=sys.stderr)
         return 1
 
     if args.onetime:
-        return run_onetime()
+        return run_onetime(nbn_ip=nbn_ip)
 
     if args.onprimary:
-        return run_onprimary()
+        return run_onprimary(nbn_ip=nbn_ip)
 
     if API_IP:
         api_thread = threading.Thread(target=_start_api, args=(API_IP,), daemon=True, name="api")
@@ -270,13 +407,17 @@ def main(argv: list[str] | None = None) -> int:
     consecutive_errors = 0
     last_state = None  # track state changes for cleaner logging
 
-    print(f"Monitoring started. NBN IP: {NBN_IP}  Interval: {INTERVAL}s")
+    print(f"Monitoring started. NBN IP: {nbn_ip}  Interval: {INTERVAL}s")
     print("Press Ctrl-C to stop.")
 
     try:
         while True:
             try:
-                _, state, ip, heartbeat_ok = check_wan(write_file=True, send_heartbeat=send_heartbeat)
+                _, state, ip, heartbeat_ok = check_wan(
+                    nbn_ip=nbn_ip,
+                    write_file=True,
+                    send_heartbeat=send_heartbeat,
+                )
 
                 if state != last_state:
                     print(f"[transition] → {state}  (external IP: {ip})")

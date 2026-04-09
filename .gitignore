@@ -20,3 +20,4 @@ wheels/
 .cache_ggshield
 
 status.json
+failover_history.csv
